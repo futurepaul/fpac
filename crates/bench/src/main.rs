@@ -198,6 +198,59 @@ fn cf_exec_raw(c: &Config, key: &net::Key, argv: &[&str], ms: u64) -> Result<(i6
     Ok((r["exitCode"].as_i64().unwrap_or(-1), r["stdout"].as_str().unwrap_or("").to_string()))
 }
 
+/// `serve-folder --root <dir> --disk <name> --listen <unix socket>
+/// --head-file <file> [--volume-gb <n>] [--object-ms <ms>]
+/// [--put-bytes-per-s <n>]`: the test kit's folder remote (a STAND-IN for
+/// the platform's route and its store) for one life of one disk, on a unix
+/// socket a host's egress proxy hands intercepted requests to. The
+/// platform's part (contract.md, section 3) is done here: the epoch is
+/// minted from the clock, above the head's, and the head is kept in
+/// `--head-file` across lives, written whenever it moves. Its first line,
+/// on stdout, says it is serving.
+fn serve_folder(args: &[String]) -> Result<Value, String> {
+    use fpac_remote::Head;
+    use fpac_testkit::folder::{Folder, Listen};
+    let root = PathBuf::from(flag(args, "--root").ok_or("--root")?);
+    let disk = flag(args, "--disk").ok_or("--disk")?;
+    let listen = PathBuf::from(flag(args, "--listen").ok_or("--listen")?);
+    let head_file = PathBuf::from(flag(args, "--head-file").ok_or("--head-file")?);
+    let head = match std::fs::read_to_string(&head_file) {
+        Ok(s) if s.trim() == "none" => None,
+        Ok(s) => Some(Head::decode(s.trim()).ok_or_else(|| format!("{}: not a head", head_file.display()))?),
+        // Only a missing file is a new disk: any other failure to read it
+        // would open an existing disk as empty.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", head_file.display())),
+    };
+    // Larger than every earlier life's: the clock, and past the head's.
+    let epoch = now_ms().max(head.map_or(0, |h| h.epoch + 1));
+    let mut folder = Folder::new(&root, &disk, epoch);
+    if let Some(gb) = flag(args, "--volume-gb") {
+        folder.volume_bytes = gb.parse::<u64>().map_err(|e| format!("--volume-gb: {e}"))? << 30;
+    }
+    folder.object_ms = flag(args, "--object-ms").map(|v| v.parse::<u64>().map_err(|e| e.to_string())).transpose()?.unwrap_or(0);
+    folder.put_bytes_per_s = flag(args, "--put-bytes-per-s").map(|v| v.parse::<u64>().map_err(|e| e.to_string())).transpose()?.unwrap_or(0);
+    *folder.head.lock().unwrap() = head;
+    let _ = std::fs::remove_file(&listen);
+    let listener = std::os::unix::net::UnixListener::bind(&listen).map_err(|e| format!("{}: {e}", listen.display()))?;
+    let running = folder.start(Listen::Unix(listener));
+    println!("{}", json!({ "serving": listen.display().to_string(), "disk": disk, "epoch": epoch, "head": head.map(|h| h.encode()) }));
+    let mut written = head;
+    // Unbounded by design: it serves until the host kills it; each pass
+    // writes the head if it moved, aside and renamed, so a kill never
+    // leaves half a head.
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = *running.folder.head.lock().unwrap();
+        if now != written {
+            let aside = head_file.with_extension("tmp");
+            std::fs::write(&aside, now.map(|h| h.encode()).unwrap_or_else(|| "none".into())).map_err(|e| e.to_string())?;
+            std::fs::rename(&aside, &head_file).map_err(|e| e.to_string())?;
+            written = now;
+        }
+    }
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
@@ -795,6 +848,10 @@ fn main() {
         }),
         (Some("ranges"), "cloudflare") => cf_ranges(args.iter().position(|a| a == "--count").and_then(|i| args.get(i + 1)).and_then(|c| c.parse().ok()).unwrap_or(1000), args.iter().any(|a| a == "--diagnose")),
         (Some("deploy"), _) => deploy(),
+        // The folder remote alone, for a host that runs its own guests (the
+        // Nitro spike's parent, sandcastle docs/nitro-spike.md): one life of
+        // one disk, until killed.
+        (Some("serve-folder"), _) => serve_folder(&args),
         // the Hermes harness's test disks, deleted once nothing needs them:
         // only names under disks/hermes- (the harness never deletes its own)
         (Some("delete-hermes-disks"), _) => Config::load().and_then(|c| {
